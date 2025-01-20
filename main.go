@@ -1,83 +1,100 @@
 package main
 
 import (
-	"fmt"
-	"log"
-	"net"
-	"os"
-	"strings"
+    "context"
+    "fmt"
+    "log"
+    "net"
+    "os"
+    "os/signal"
+    "strings"
+    "syscall"
+    "time"
 
-	"github.com/jessevdk/go-flags"
+    "github.com/spf13/pflag"
 )
 
 var opts struct {
-	Host   string `long:"host" default:"0.0.0.0" description:"IP to bind to"`
-	Port   uint16 `long:"port" default:"2202" description:"UDP port to bind to"`
-	File   string `long:"file" default:"" description:"dump received data to a dump file"`
-	Buffer int    `long:"buffer" default:"10240" description:"max buffer size for the socket io"`
+    Host   string
+    Port   uint16
+    File   string
+    Buffer int
+}
+
+func init() {
+    pflag.StringVar(&opts.Host, "host", "0.0.0.0", "IP to bind to")
+    pflag.Uint16Var(&opts.Port, "port", 2202, "UDP port to bind to")
+    pflag.StringVar(&opts.File, "file", "", "dump received data to a dump file")
+    pflag.IntVar(&opts.Buffer, "buffer", 10240, "max buffer size for the socket io")
 }
 
 func newUDPListener(host string, port uint16) (*net.UDPConn, error) {
-	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%v:%d", host, port))
-
-	if err != nil {
-		return nil, err
-	}
-
-	l, err := net.ListenUDP("udp", addr)
-
-	if err != nil {
-		return nil, err
-	}
-
-	return l, nil
+    addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", host, port))
+    if err != nil {
+        return nil, err
+    }
+    conn, err := net.ListenUDP("udp", addr)
+    if err != nil {
+        return nil, err
+    }
+    return conn, nil
 }
 
-func handleClient(conn *net.UDPConn) {
-	b := make([]byte, opts.Buffer)
-	n, addr, err := conn.ReadFromUDP(b)
-	if err != nil {
-		log.Printf("Read from UDP failed, err: %v", err)
-		return
-	}
-	log.Printf("Read from client(%v:%v), len: %v, [%v]", addr.IP, addr.Port, n, string(b[:n]))
+func handleClient(ctx context.Context, conn *net.UDPConn) {
+    buffer := make([]byte, opts.Buffer)
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        default:
+            conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+            n, addr, err := conn.ReadFromUDP(buffer)
+            if err != nil && !strings.Contains(err.Error(), "i/o timeout") {
+                log.Printf("Read from UDP failed, err: %v", err)
+                return
+            }
+            if err == nil {
+                log.Printf("Read from client(%v:%v), len: %v, [%v]", addr.IP, addr.Port, n, string(buffer[:n]))
 
-	if len(opts.File) != 0 {
-		f, err := os.OpenFile(opts.File, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
-		if err != nil {
-			log.Printf("Open file failed, err: %v", err)
-			return
-		}
-		defer f.Close()
-		if _, err = f.Write(b[:n]); err != nil {
-			log.Printf("Write file failed, err: %v", err)
-			return
-		}
-	}
+                if len(opts.File) != 0 {
+                    f, err := os.OpenFile(opts.File, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+                    if err != nil {
+                        log.Printf("Open file failed, err: %v", err)
+                        return
+                    }
+                    defer f.Close()
+                    if _, err = f.Write(buffer[:n]); err != nil {
+                        log.Printf("Write file failed, err: %v", err)
+                        return
+                    }
+                }
 
-	conn.WriteToUDP(b[:n], addr)
+                conn.WriteToUDP(buffer[:n], addr)
+            }
+        }
+    }
 }
 
 func main() {
-	_, err := flags.Parse(&opts)
-	if err != nil {
-		if !strings.Contains(err.Error(), "Usage") {
-			log.Printf("error: %v\n", err.Error())
-			os.Exit(1)
-		} else {
-			// log.Printf("%v\n", err.Error())
-			os.Exit(0)
-		}
-	}
+    pflag.Parse()
 
-	l, err := newUDPListener(opts.Host, opts.Port)
-	if err != nil {
-		panic(err)
-	}
+    sigChannel := make(chan os.Signal, 1)
+    signal.Notify(sigChannel, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 
-	log.Printf(">> Starting udpdump, listening at %v:%v...", opts.Host, opts.Port)
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
 
-	for {
-		handleClient(l)
-	}
+    conn, err := newUDPListener(opts.Host, opts.Port)
+    if err != nil {
+        log.Fatalf("Failed to create UDP listener: %v", err)
+    }
+    defer conn.Close()
+
+    log.Printf(">> Starting udpdump, listening at %s:%d...", opts.Host, opts.Port)
+
+    go handleClient(ctx, conn)
+
+    sig := <-sigChannel
+    log.Printf("Received signal [%v], shutting down...", sig)
 }
+
